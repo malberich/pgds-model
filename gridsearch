@@ -1,0 +1,100 @@
+#!/bin/bash
+
+DATASET=$1
+
+if [ "${1}" == "" ]; then
+	exit 1
+fi
+
+
+lossfuncs=("hinge" "logistic" "squared")
+kernels=("--boosting 5" "--boosting=10" "--boosting=25" "--log_multi=2" "--nn=1" "--nn=10" "--ftrl" "")
+decay_lr=("1" "0.99" "0.95" "0.9")
+ngrams=("2" "3" "4")
+skips=("2" "3")
+lrs=("10" "5" "1" "0.75" "0.5" "0.1" "0.01")
+passes=("10" "20") # passes=("5" "10" "20" "40")
+L1=("0") # L1=("0" "0.1" "0.01" "0.001" "0.0001" "0.00001")
+L2=("0") # L2=("0" "0.1" "0.01" "0.001" "0.0001" "0.00001")
+thresholds=("0.5" "0.75" "0.9" "0.99")
+set_rows=`wc -l ${1}-classified.vw | cut -d' ' -f1`
+let train_rows=$((($set_rows*6)/10))
+let cv_rows=$((($set_rows*2)/10))
+let head_cv="$((`echo $cv_rows'+'$train_rows | bc -l`))"
+let test_rows=$((($set_rows*2)/10))
+
+
+echo "Dividing ${1} dataset between train (${train_rows}) CV (${cv_rows}) and test (${test_rows})"
+head -n ${train_rows} ${1}-classified.vw > ${1}-classified.train.vw
+head -n ${head_cv} ${1}-classified.vw | tail -n $cv_rows > ${1}-classified.cv.vw
+tail -n ${test_rows} ${1}-classified.vw > ${1}-classified.test.vw
+
+cut -d' ' -f1 ${1}-classified.cv.vw > ${1}.targets.cv
+cut -d' ' -f1 ${1}-classified.test.vw > ${1}.targets.test
+max_f1=$((0))
+for lossfunc in "${lossfuncs[@]}"
+do
+	for kernel in "${kernels[@]}"
+	do
+		for decay in "${decay_lr[@]}"
+		do
+			for ngram in "${ngrams[@]}"
+			do
+				for skip in "${skips[@]}"
+				do
+					for pass in "${passes[@]}"
+					do
+						for lr in "${lrs[@]}"
+						do
+							for l1 in "${L1[@]}"
+							do
+								for l2 in "${L2[@]}"
+								do
+									PARAMSET="lossfunc=${lossfunc}, algorithm=${kernel}, passes=${pass}, decay=${decay}, ngram=${ngram}, skip=${skip}, passes=${pass}, learning_rate=${lr}, L1=${l1}, L2=${l2}"
+									echo ${PARAMSET}
+									DIGEST=`echo "${PARAMSET}" | md5sum | awk '{print $1}'`
+									if [ ! -f "./models/${1}-${DIGEST}.model.vw" ]; then
+										echo "${DIGEST} ${PARAMSET}\n" >> models-ids.txt
+		    							vw  --quiet \
+										 	--cache \
+											--passes $pass \
+											--decay_learning_rate ${decay} \
+											-l ${lr} \
+											${kernel} \
+											--holdout_off \
+											-d ${1}-classified.train.vw \
+											--ngram ${ngram} \
+											--skips ${skip} \
+											--l1 ${l1} \
+											--l2 ${l2} \
+											--loss_function ${lossfunc} \
+											-f ./models/${1}-${DIGEST}.model.vw
+									fi
+
+									vw --quiet -i ./models/${1}-${DIGEST}.model.vw -t -d ${1}-classified.cv.vw -p ${1}.predictions.cv
+									cut -d' ' -f1 ${1}.predictions.cv > ${1}.predicted.cv
+									for threshold in "${thresholds[@]}"
+									do
+										~/Documents/workspace/perf/perf.linux/perf -acc -roc -pre -rec -prf -threshold ${threshold} -files ${1}.targets.cv ${1}.predicted.cv
+										~/Documents/workspace/perf/perf.linux/perf -prf -threshold ${threshold} -files ${1}.targets.cv ${1}.predicted.cv > current_perf
+										current_f1=`grep PRF current_perf | awk '{print $2}'`
+										is_greater_f1=`echo ${current_f1}'>'${max_f1} | bc -l`
+										if [ "${is_greater_f1}" == "1" ]; then
+											echo "New optimum F1-score ${current_f1}. Going to perform F1 over test set"
+											echo "***TEST SET***"
+											max_f1="${current_f1}"
+											vw --quiet -i ./models/${1}-${DIGEST}.model.vw -t -d ${1}-classified.test.vw -p ${1}.predictions.test
+											cut -d' ' -f1 ${1}.predictions.test > ${1}.predicted.test
+											~/Documents/workspace/perf/perf.linux/perf -acc -roc -pre -rec -prf -threshold ${threshold} -files ${1}.targets.test ${1}.predicted.test
+											echo "*** END TEST SET***"
+										fi
+									done
+								done
+							done
+						done
+					done
+				done
+			done
+		done
+	done
+done
